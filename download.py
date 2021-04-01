@@ -5,81 +5,54 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+from pathlib import Path
 import xml.etree.ElementTree as ET
+import shutil
 
 
-class Downloader:
+def fetch(url, target: Path):
+    try:
+        print(f"Downloading {url}")
+        with urllib.request.urlopen(url) as rs:
+            os.makedirs(target.parent, exist_ok=True)
+            with open(target, 'wb') as fp:
+                shutil.copyfileobj(rs, fp)
+        return target
+    except urllib.error.HTTPError as e:
+        print(f"Download failed: {url} ({e})")
+        return False
 
-    def __init__(self, url, outdir):
-        m = re.match(r'^.*/playback/presentation/2\.0/playback.html\?meetingId=(\S+)$', url)
-        if m is not None:
-            id = m.group(1)
-        else:
-            m = re.match(r'.*/playback/presentation/2.3/(\S+)$', url)
-            if m is not None:
-                id = m.group(1)
-            else:
-                raise ValueError(f"Does not look like a BBB playback URL: {url}")
+def getMeetingId(url):
+    for pattern in (
+        r'^.*/playback/presentation/2\.0/playback.html\?meetingId=(\S+)$',
+        r'^.*/playback/presentation/2.3/(\S+)$'):
+        m = re.match(pattern, url)
+        if m:
+            return m.group(1)
+    raise ValueError(f"Unsupported presentation URL: {url}")
 
-        id = m.group(1)
-        self.base_url = urllib.parse.urljoin(url, f"/presentation/{id}/")
-        self.outdir = outdir
+def download(url, outputPath: Path):
+    meetingId = getMeetingId(url)
+    base = urllib.parse.urljoin(url, f"/presentation/{meetingId}/")
+    def sfetch(name):
+        return fetch(urllib.parse.urljoin(base, name), outputPath / name)
 
-    def _get(self, path):
-        url = urllib.parse.urljoin(self.base_url, path)
-        outpath = os.path.join(self.outdir, path)
-        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+    sfetch('metadata.xml')
+    sfetch('shapes.svg')
 
-        print(f"Downloading {url}...")
-        with open(outpath, 'wb') as fp:
-            buf = bytearray(64 * 1024)
-            req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'bbb-video-downloader/1.0')
-            resp = urllib.request.urlopen(req)
-            content_length = resp.headers['Content-Length']
-            if content_length is not None: content_length = int(content_length)
-            while True:
-                with resp:
-                    n = resp.readinto(buf)
-                    while n > 0:
-                        fp.write(buf[:n])
-                        n = resp.readinto(buf)
-                current = fp.seek(0, os.SEEK_CUR)
-                if content_length is None or current >= content_length:
-                    break
-                print("continuing...")
-                req = urllib.request.Request(url)
-                req.add_header('User-Agent', 'bbb-video-downloader/1.0')
-                req.add_header('Range', f'bytes={current}-')
-                resp = urllib.request.urlopen(req)
-        return outpath
+    with open(outputPath / 'shapes.svg', "rb") as fp:
+        shapes = ET.parse(fp)
+        for img in shapes.iterfind('.//{http://www.w3.org/2000/svg}image'):
+            sfetch(img.get('{http://www.w3.org/1999/xlink}href'))
 
-    def download(self):
-        self._get('metadata.xml')
-        shapes = self._get('shapes.svg')
-        doc = ET.parse(shapes)
-        for imgurl in {img.get('{http://www.w3.org/1999/xlink}href')
-                       for img in doc.iterfind('.//{http://www.w3.org/2000/svg}image')}:
-            self._get(imgurl)
-
-        self._get('panzooms.xml')
-        self._get('cursor.xml')
-        self._get('deskshare.xml')
-        self._get('presentation_text.json')
-        self._get('captions.json')
-        self._get('slides_new.xml')
-
-        self._get('video/webcams.webm')
-        self._get('deskshare/deskshare.webm')
-
-
-def main(argv):
-    if len(argv) != 3:
-        sys.stderr.write('usage: {} PRESENTATION-URL OUTPUT-DIR\n'.format(argv[0]))
-        return 1
-    d = Downloader(argv[1], argv[2])
-    d.download()
-
+    sfetch('panzooms.xml')
+    sfetch('cursor.xml')
+    sfetch('deskshare.xml')
+    sfetch('presentation_text.json')
+    sfetch('captions.json')
+    sfetch('slides_new.xml')
+    sfetch('video/webcams.webm')
+    sfetch('deskshare/deskshare.webm')
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv))
+    download(sys.argv[1], Path(sys.argv[2]))
