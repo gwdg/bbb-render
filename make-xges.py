@@ -1,438 +1,514 @@
-#!/usr/sbin/env python3
+#!/usr/bin/python3
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+from decimal import Decimal
 import argparse
 import os
 import sys
-import xml.etree.ElementTree as ET
-
 import cairosvg
+from intervaltree import Interval, IntervalTree
+from collections import namedtuple
+
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstPbutils', '1.0')
 gi.require_version('GES', '1.0')
 from gi.repository import GLib, GObject, Gst, GstPbutils, GES
 
-from intervaltree import Interval, IntervalTree
-
+import xml.etree.ElementTree as ET
 ET.register_namespace("", "http://www.w3.org/2000/svg")
+ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+
 
 def file_to_uri(path):
     path = os.path.realpath(path)
     return 'file://' + path
 
 
+def minmax(low, val, high):
+    return max(low, min(val, high))
+
+
+def to_ns(val, digits=3):
+    """ Converts seconds (int, float, str) to Gstreamer native timestamps
+        (nanoseconds) while avoiding most floating-point rounding errors.
+
+        Input values are natively rounded to 3 decimal places (milliseconds) by
+        default.
+    """
+    return int(round(Decimal(val), digits) * Gst.SECOND)
+
+
 class Presentation:
+    """ Presentation to xges project renderer.
 
-    def __init__(self, opts):
-        self.opts = opts
-        self.cam_width = round(opts.width * opts.webcam_size / 100)
-        self.slides_width = opts.width - self.cam_width
+        Notes: All public APIs accept timestamps and durations as seconds. All
+        internal APIs use Gst native resolution (nanoseconds).
 
+    """
+
+    def __init__(self, source, size):
+        self._asset_cache = {}
+        self._layer_cache = {}
+
+        self.asset_path = os.path.abspath(source)
+        self.xml_meta = ET.parse(self._asset_path('metadata.xml'))
+
+        self.name = self.xml_meta.find("./meta/meetingName").text.strip()
+        self.presentation_length = float(
+            self.xml_meta.find('./playback/duration').text.strip()
+        ) / 1000
+
+        self.width, self.height = size
+        self._opening_credits = []
+        self._closing_credits = []
+        self._cut = 0, to_ns(self.presentation_length)
+
+        # Setup timeline, project, and audio/video tracks
         self.timeline = GES.Timeline.new_audio_video()
-
-        # Get the timeline's two tracks
         self.video_track, self.audio_track = self.timeline.get_tracks()
         if self.video_track.type == GES.TrackType.AUDIO:
             self.video_track, self.audio_track = self.audio_track, self.video_track
         self.project = self.timeline.get_asset()
-        self._assets = {}
 
-        # Construct the presentation
-        self.set_track_caps()
-        self.set_project_metadata()
-        self.add_credits()
-        self.add_webcams()
-        if self.opts.annotations:
-            self.add_slides_with_annotations()
-        else:
-            self.add_slides()
-        self.add_deskshare()
-        self.add_backdrop()
+        self.set_track_caps(fps=24, hz=48000)
+        self.set_project_metadata("name", self.name)
+        self.init_layers("Credits", "Camera", "Slides", "Deskshare", "Backdrop")
 
-    def _add_layer(self, name):
-        layer = self.timeline.append_layer()
-        layer.register_meta_string(GES.MetaFlag.READWRITE, 'video::name', name)
-        return layer
+    def cut(self, start, end=0):
+        """ Define which part of the presentation should be rendered.
 
-    def _get_asset(self, path):
-        asset = self._assets.get(path)
+            Both start and end time are in seconds from the beginning.
+            If end 0 or negative, it is counted from the end of the presentation."""
+        if end <= 0:
+            end += to_ns(self.presentation_length)
+        self._cut = to_ns(start), to_ns(end)
+
+    def set_project_metadata(self, name, value):
+        self.project.register_meta_string(
+            GES.MetaFlag.READWRITE, name, value)
+
+    def set_track_caps(self, fps=24, hz=48000):
+        """ Set frame rate and audio sampling rate """
+        self.video_track.props.restriction_caps = Gst.Caps.from_string(
+            f'video/x-raw(ANY), width=(int){self.width}, height=(int){self.height}, '
+            f'framerate=(fraction){fps}/1')
+        self.audio_track.props.restriction_caps = Gst.Caps.from_string(
+            f'audio/x-raw(ANY), rate=(int){hz}, channels=(int)2')
+
+        vp8_preset = Gst.ElementFactory.make('vp8enc', 'vp8_preset')
+        vp8_preset.set_property('threads', 8)
+        vp8_preset.set_property('token-partitions', 2)
+        vp8_preset.set_property('target-bitrate', 2500000)
+        vp8_preset.set_property('deadline', 0)  # best
+        vp8_preset.set_property('end-usage', 2)  # Constant Quality Mode
+        vp8_preset.set_property('cq-level', 10)
+        Gst.Preset.save_preset(vp8_preset, 'vp8_preset')
+
+        profile = GstPbutils.EncodingContainerProfile.new(
+            'default', 'bbb-render encoding profile',
+            Gst.Caps.from_string('video/webm'))
+        profile.add_profile(GstPbutils.EncodingVideoProfile.new(
+            Gst.Caps.from_string('video/x-vp8'), 'vp8_preset',
+            self.video_track.props.restriction_caps, 0))
+        profile.add_profile(GstPbutils.EncodingAudioProfile.new(
+            Gst.Caps.from_string('audio/x-opus'), None,
+            self.audio_track.props.restriction_caps, 0))
+        self.project.add_encoding_profile(profile)
+
+    def _add_clip(self, layer, asset, *, ts, dt, pos, size, skip=0):
+        """ Displays and asset on a specific layer at timestamp `ts` for `dt`
+             seconds, skipping the first `skip` seconds. The asset is shown at
+             position `pos` stretched to `size`. """
+        logging.info("Clip %s %r ts=%d dt=%d skip=%d pos=%r size=%r",
+            layer, asset, ts, dt, skip, pos, size)
+
+        layer = self._get_layer(layer)
+        asset = self._get_asset(asset)
+        asset_duration = self._get_duration(asset)
+        #dt = minmax(0, dt, asset_duration - skip)
+
+        clip = layer.add_asset(asset, ts, skip, dt, GES.TrackType.UNKNOWN)
+        for element in clip.find_track_elements(self.video_track, GES.TrackType.VIDEO, GObject.TYPE_NONE):
+            element.set_child_property("posx", pos[0])
+            element.set_child_property("posy", pos[1])
+            element.set_child_property("width", size[0])
+            element.set_child_property("height", size[1])
+
+    def _get_layer(self, name):
+        return self._layer_cache[name]
+
+    def _asset_path(self, name):
+        if not os.path.isabs(name):
+            name = os.path.join(self.asset_path, name)
+        return os.path.realpath(name)
+
+    def _get_asset(self, name):
+        path = self._asset_path(name)
+        uri = file_to_uri(path)
+        asset = self._asset_cache.get(uri)
         if asset is None:
-            asset = GES.UriClipAsset.request_sync(file_to_uri(path))
+            asset = GES.UriClipAsset.request_sync(uri)
             self.project.add_asset(asset)
-            self._assets[path] = asset
+            self._asset_cache[uri] = asset
         return asset
 
-    def _get_dimensions(self, asset):
+    def _get_size(self, asset):
+        if isinstance(asset, str):
+            asset = self._get_asset(asset)
         info = asset.get_info()
         video_info = info.get_video_streams()[0]
         return (video_info.get_width(), video_info.get_height())
 
-    def _constrain(self, dimensions, bounds):
-        width, height = dimensions
-        max_width, max_height = bounds
-        new_height = round(height * max_width / width)
-        if new_height <= max_height:
-            return max_width, new_height
-        return round(width * max_height / height), max_height
+    def _get_duration(self, asset):
+        """ Return asset play duration """
+        if isinstance(asset, str):
+            asset = self._get_asset(asset)
+        return asset.props.duration
 
-    def _add_clip(self, layer, asset, start, inpoint, duration,
-                  posx, posy, width, height, trim_end=True):
-        if trim_end:
-            # Skip clips entirely after the end point
-            if start > self.end_time:
-                return
-            # Truncate clips that go past the end point
-            duration = min(duration, self.end_time - start)
+    def fit(self, asset, box, align="cc", shrink_only=False):
+        """ Fit and align an asset in a bounding box.
 
-        # Skip clips entirely before the start point
-        if start + duration < self.start_time:
-            return
-        # Rewrite start, inpoint, and duration to account for time skip
-        start -= self.start_time
-        if start < 0:
-            duration += start
-            if not asset.is_image():
-                inpoint += -start
-            start = 0
+            The asset can be a file path, a GES.Asset, or a (w,h) tuple.
+            The box can have two elements (w,h) or four (x,y,w,h).
+            Alignment is a two-character string (l|c|r + t|c|b).
 
-        # Offset start point by the length of the opening credits
-        start += self.opening_length
+            Returns (x,y,w,h)
+        """
 
-        clip = layer.add_asset(asset, start, inpoint, duration,
-                               GES.TrackType.UNKNOWN)
-        for element in clip.find_track_elements(
-                self.video_track, GES.TrackType.VIDEO, GObject.TYPE_NONE):
-            element.set_child_property("posx", posx)
-            element.set_child_property("posy", posy)
-            element.set_child_property("width", width)
-            element.set_child_property("height", height)
+        rect = asset
+        if isinstance(rect, (str, GES.Asset)):
+            rect = self._get_size(rect)
+        aw, ah = rect
 
-    def set_track_caps(self):
-        # Set frame rate and audio rate based on webcam capture
-        asset = self._get_asset(
-            os.path.join(self.opts.basedir, 'video/webcams.webm'))
-        info = asset.get_info()
+        if len(box) == 2:
+            box = [0,0] + list(box)
+        bx, by, bw, bh = box
 
-        video_info = info.get_video_streams()[0]
-        self.video_track.props.restriction_caps = Gst.Caps.from_string(
-            'video/x-raw(ANY), width=(int){}, height=(int){}, '
-            'framerate=(fraction){}/{}'.format(
-                self.opts.width, self.opts.height,
-                video_info.get_framerate_num(),
-                video_info.get_framerate_denom()))
+        x,y,w,h = bx, by, aw, ah
 
-        audio_info = info.get_audio_streams()[0]
-        self.audio_track.props.restriction_caps = Gst.Caps.from_string(
-            'audio/x-raw(ANY), rate=(int){}, channels=(int){}'.format(
-                audio_info.get_sample_rate(), audio_info.get_channels()))
+        if not (shrink_only and aw <= bw and ah <= bh):
+            # Asset needs to be resized to fit box
+            scale = (aw / ah) / (bw / bh)
+            if scale > 1: # Asset wider than box
+                w, h = bw, round(bh / scale)
+            else:         # Asset taller than box
+                w, h = round(bw*scale), bh
 
-        # Set start and end time from options
-        self.start_time = round(self.opts.start * Gst.SECOND)
-        if self.opts.end is None:
-            self.end_time = asset.props.duration
-        else:
-            self.end_time = round(self.opts.end * Gst.SECOND)
+        if align[0] == "c":
+            x += (bw-w)//2
+        elif align[0] == "r":
+            x += (bw-w)
+        if align[1] == "c":
+            y += (bh-h)//2
+        elif align[1] == "b":
+            y += (bh-h)
 
-        # Offset for the opening credits
-        self.opening_length = 0
+        return x, y, w, h
 
-        # Add an encoding profile for the benefit of Pitivi
-        profile = GstPbutils.EncodingContainerProfile.new(
-            'MP4', 'bbb-render encoding profile',
-            Gst.Caps.from_string('video/quicktime,variant=iso'))
-        profile.add_profile(GstPbutils.EncodingVideoProfile.new(
-            Gst.Caps.from_string('video/x-h264,profile=high'), None,
-            self.video_track.props.restriction_caps, 0))
-        profile.add_profile(GstPbutils.EncodingAudioProfile.new(
-            Gst.Caps.from_string('audio/mpeg,mpegversion=4,base-profile=lc'),
-            None, self.audio_track.props.restriction_caps, 0))
-        self.project.add_encoding_profile(profile)
+    def init_layers(self, *layers):
+        for name in layers:
+            layer = self.timeline.append_layer()
+            layer.register_meta_string(GES.MetaFlag.READWRITE, 'video::name', name)
+            self._layer_cache[name] = layer
 
-    def set_project_metadata(self):
-        doc = ET.parse(os.path.join(self.opts.basedir, 'metadata.xml'))
-        name = doc.find('./meta/name')
-        if name is not None:
-            self.project.register_meta_string(
-                GES.MetaFlag.READWRITE, 'name', name.text.strip())
+    @property
+    def _opening_credits_length(self):
+        return sum(duration for (skip, duration, asset) in self._opening_credits)
 
-    def add_webcams(self):
-        layer = self._add_layer('Camera')
-        asset = self._get_asset(
-            os.path.join(self.opts.basedir, 'video/webcams.webm'))
-        dims = self._get_dimensions(asset)
-        if self.opts.stretch_webcam:
-            dims = (dims[0] * 16/12, dims[1])
-        width, height = self._constrain(
-            dims, (self.cam_width, self.opts.height))
+    @property
+    def _closing_credits_length(self):
+        return sum(duration for (skip, duration, asset) in self._closing_credits)
 
-        self._add_clip(layer, asset, 0, 0, asset.props.duration,
-                       self.opts.width - width, 0,
-                       width, height)
+    @property
+    def _total_length(self):
+        return self._opening_credits_length + self._cut[1] - self._cut[0] + self._closing_credits_length
 
-    def add_slides(self):
-        layer = self._add_layer('Slides')
-        doc = ET.parse(os.path.join(self.opts.basedir, 'shapes.svg'))
+    def add_webcams(self, fit, align):
+        video = 'video/webcams.webm'
+        box = self.fit(video, fit, align)
+
+        ts = self._opening_credits_length
+        skip = self._cut[0]
+        dt = self._cut[1] - skip
+
+        self._add_clip("Camera", video,
+            ts=ts, dt=dt, skip=skip,
+            pos=box[:2], size=box[2:])
+
+    def add_slides(self, fit, align):
+        maxsize = fit[2:]
+        skip = self._cut[0]
+        maxdt = self._cut[1] - skip
+
+        for png, start, duration in self._generate_slides(maxsize):
+            # start and duration are already cut to the desired presentation time frame
+            size = self._get_size(png)
+            box = self.fit(size, fit, align)
+            start += self._opening_credits_length
+
+            self._add_clip("Slides", png,
+              ts=start, dt=duration,
+              pos=box[:2], size=box[2:])
+
+    def _generate_slides(self, maxsize):
+        """ Yield (png_path, start_time, duration) for each version of each
+          slide, in order. Both start and duration are in seconds.
+
+          This honors cut(start, end) and only returns slides and timings that
+          fit into the configured timeframe. """
+
+        start_ts, end_ts = self._cut
+
+        doc = ET.parse(self._asset_path('shapes.svg'))
         for img in doc.iterfind('./{http://www.w3.org/2000/svg}image'):
+            logging.debug("Found slide: %s", img.get("id"))
+
             path = img.get('{http://www.w3.org/1999/xlink}href')
-            # If this is a "deskshare" slide, don't show anything
-            if path.endswith('/deskshare.png'):
-                continue
-
-            start = round(float(img.get('in')) * Gst.SECOND)
-            end = round(float(img.get('out')) * Gst.SECOND)
-
-            # Don't bother creating an asset for out of range slides
-            if end < self.start_time or start > self.end_time:
-                continue
-
-            asset = self._get_asset(os.path.join(self.opts.basedir, path))
-            width, height = self._constrain(
-                self._get_dimensions(asset),
-                (self.slides_width, self.opts.height))
-            self._add_clip(layer, asset, start, 0, end - start,
-                           0, 0, width, height)
-
-    def add_slides_with_annotations(self):
-
-        def data_reducer(a, b):
-            return a+b
-
-        layer = self._add_layer('Slides')
-
-        doc = ET.parse(os.path.join(self.opts.basedir, 'shapes.svg'))
-
-        for img in doc.iterfind('./{http://www.w3.org/2000/svg}image'):
-            path = img.get('{http://www.w3.org/1999/xlink}href')
-            img.set('{http://www.w3.org/1999/xlink}href', os.path.join(self.opts.basedir, path))
-            if path.endswith('/deskshare.png'):
-                continue
-
+            img_start = to_ns(img.get('in'))
+            img_end = to_ns(img.get('out'))
             img_width = int(img.get('width'))
             img_height = int(img.get('height'))
+            size = self.fit((img_width, img_height), (0, 0, maxsize[0], maxsize[1]))[2:]
 
+            if path.endswith('/deskshare.png'):
+                logging.info("Skipping: Slides invisible during deskshare")
+                continue
+
+            if img_start >= end_ts or img_end <= start_ts:
+                logging.info("Skipping: Slide not in presentation time frame")
+                continue
+
+            # Cut slide duration to presentation time frame
+            img_start = max(img_start, start_ts)
+            img_end =  min(img_end, end_ts)
+
+            # Fix backgfound image path
+            img.set('{http://www.w3.org/1999/xlink}href', self._asset_path(path))
+
+            # Find an SVG group with shapes belonging to this slide.
             canvas = doc.find('./{{http://www.w3.org/2000/svg}}g[@class="canvas"][@image="{}"]'.format(img.get('id')))
 
-            img_start = round(float(img.get('in')) * Gst.SECOND)
-            img_end = round(float(img.get('out')) * Gst.SECOND)
-
-            t = IntervalTree()
-            t.add(Interval(begin=img_start, end=img_end, data=[]))
-
             if canvas is None:
-                svg = ET.XML(
-                    '<svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}"></svg>'.format(img_width,
-                                                                                                              img_height))
-                svg.append(img)
+                # No annotations, just a slide.
+                png = self._render_slide([img], size, f'{img.get("id")}-0.png')
+                yield png, img_start, img_end-img_start
+                continue
 
-                pngpath = os.path.join(self.opts.basedir, '{}.png'.format(img.get('id')))
+            # Collect shapes. Each shape can have multiple draw-steps with the same
+            # `shape` id and only the most recent version is visible.
+            shapes = {} # id -> [(start, undo, shape), ...]
+            for shape in canvas.iterfind('./{http://www.w3.org/2000/svg}g[@class="shape"]'):
+                shape_id = shape.get('shape')
+                shape_style = shape.get('style')
+                shape.set('style', shape_style.replace('visibility:hidden;', ''))
 
-                if not os.path.exists(pngpath):
-                    cairosvg.svg2png(bytestring=ET.tostring(svg).decode('utf-8').encode('utf-8'), write_to=pngpath,
-                                     output_width=img_width, output_height=img_height)
+                # Poll results are embedded as images. Make the href absolute.
+                for shape_img in shape.iterfind('./{http://www.w3.org/2000/svg}image'):
+                    shape_img.set('{http://www.w3.org/1999/xlink}href',
+                        self._asset_path(shape_img.get('{http://www.w3.org/1999/xlink}href')))
 
-                asset = self._get_asset(pngpath)
-                width, height = self._constrain(
-                    self._get_dimensions(asset),
-                    (self.slides_width, self.opts.height))
-                self._add_clip(layer, asset, img_start, 0, img_end - img_start,
-                               0, 0, width, height)
+                start = to_ns(shape.get('timestamp'))
+                undo = to_ns(shape.get('undo'))
+                shapes.setdefault(shape_id, []).append((start, undo, shape))
 
-            else:
-                shapes = {}
-                for shape in canvas.iterfind('./{http://www.w3.org/2000/svg}g[@class="shape"]'):
+            # Build timeline of shapes and draw-steps during this slide
+            timeline = IntervalTree()
+            timeline.add(Interval(begin=img_start, end=img_end, data=[]))
 
-                    shape_style = shape.get('style')
-                    shape.set('style', shape_style.replace('visibility:hidden;', ''))
+            # For each shape-id, order draw-steps by start-time and calculate end-time.
+            for shape_id, shapes in shapes.items():
+                shapes = sorted(shapes) # sort by start time
+                zindex = shapes[0][0] # Use start time for z-layer ordering (new on top)
 
-                    for shape_img in shape.iterfind('./{http://www.w3.org/2000/svg}image'):
-                        print(ET.tostring(shape_img))
-                        shape_img_path = shape_img.get('{http://www.w3.org/1999/xlink}href')
-                        shape_img.set('{http://www.w3.org/1999/xlink}href', os.path.join(self.opts.basedir, shape_img_path))
-
-                    start = img_start
-                    timestamp = shape.get('timestamp')
-                    shape_start = round(float(timestamp) * Gst.SECOND)
-                    if shape_start > img_start:
-                        start = shape_start
-
+                for i, (start, undo, shape) in enumerate(shapes):
+                    # When switching back to an old slides, shape start-time is way too small
+                    start = max(img_start, start)
                     end = img_end
-                    undo = shape.get('undo')
-                    shape_end = round(float(undo) * Gst.SECOND)
-                    if undo != '-1' and shape_end != 0 and shape_end < end:
-                        end = shape_end
 
-                    if end < start:
-                        continue
+                    if i+1 < len(shapes):
+                        # Hide non-final draw-steps when replaced by the next draw-step.
+                        end = shapes[i+1][0]
+                    elif undo > 0:
+                        # Shape was erased, so hide it earlier
+                        end = undo
 
-                    shape_id = shape.get('shape')
-                    if shape_id in shapes:
-                        shapes[shape_id].append({
-                            'start': start,
-                            'end': end,
-                            'shape': shape
-                        })
-                    else:
-                        shapes[shape_id] = [{
-                            'start': start,
-                            'end': end,
-                            'shape': shape
-                        }]
+                    if end <= start:
+                        continue # May happen if self._cut removed parts of a slide livetime
+                    if start >= img_end:
+                        loging.warning("Shape timing is off: start=%d end=%s", start/Gst.SECOND, end/Gst.SECOND)
+                        continue # Should not happen, but who knows
 
-                for shape_id, shapes_list in shapes.items():
-                    sorted_shapes = sorted(shapes_list, key=lambda k: k['start'])
-                    index = 1
-                    for s in sorted_shapes:
-                        if index < len(shapes_list):
-                            s['end'] = sorted_shapes[index]['start']
-                        t.add(Interval(begin=s['start'], end=s['end'], data=[s['shape']]))
-                        index += 1
+                    timeline.add(Interval(begin=start, end=end, data=[(zindex, shape)]))
 
-                t.split_overlaps()
-                t.merge_overlaps(data_reducer=data_reducer)
-                for index, interval in enumerate(sorted(t)):
-                    svg = ET.XML(
-                        '<svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}"></svg>'.format(img_width,
-                                                                                                                  img_height))
-                    svg.append(img)
-                    for d in interval.data:
-                        svg.append(d)
+            # In multiuser-canvas mode, shape drawing may overlap in time. This
+            # split+merge step ensure that we have non-overlapping time slices, each
+            # containing all shapes that are visible in that slice.
+            timeline.split_overlaps()
+            timeline.merge_overlaps(data_reducer=lambda a,b: a+b)
 
-                    pngpath = os.path.join(self.opts.basedir, '{}-{}.png'.format(img.get('id'), index))
+            # Render one PNG per time slice
+            for i, interval in enumerate(sorted(timeline)):
+                shapes = [shape for zindex, shape in sorted(interval.data)]
+                png = self._render_slide([img] + shapes, size, f'{img.get("id")}-{i}.png')
+                yield png, interval.begin, interval.end-interval.begin
 
-                    if not os.path.exists(pngpath):
-                        cairosvg.svg2png(bytestring=ET.tostring(svg).decode('utf-8').encode('utf-8'), write_to=pngpath,
-                                         output_width=img_width, output_height=img_height)
+    def _render_slide(self, layers, size, name):
+        path = self._asset_path(name)
+        if not os.path.exists(path):
+            svg = ET.XML(f'<svg version="1.1" xmlns="http://www.w3.org/2000/svg"></svg>')
 
-                    asset = self._get_asset(pngpath)
-                    width, height = self._constrain(
-                        self._get_dimensions(asset),
-                        (self.slides_width, self.opts.height))
-                    self._add_clip(layer, asset, interval.begin, 0, interval.end - interval.begin,
-                                   0, 0, width, height)
+            # Scale to desired size but keep coordinates
+            bg = layers[0] # Use first (bottom) layer as reference frame
+            bgw, bgh = int(bg.get("width")), int(bg.get("height"))
+            svg.set('viewBox', f'0 0 {bgw} {bgh}')
+            svg.set("width", str(size[0]))
+            svg.set("height", str(size[1]))
 
+            for layer in layers:
+                svg.append(layer)
 
-    def add_deskshare(self):
-        doc = ET.parse(os.path.join(self.opts.basedir, 'deskshare.xml'))
+            cairosvg.svg2png(bytestring=ET.tostring(svg), write_to=path)
+
+        return path
+
+    def add_deskshare(self, fit, align):
+        video = self._asset_path('deskshare/deskshare.webm')
+        if not os.path.exists(video):
+            return
+
+        doc = ET.parse(self._asset_path('deskshare.xml'))
         events = doc.findall('./event')
-        if len(events) == 0:
-            return
 
-        layer = self._add_layer('Deskshare')
-        asset = self._get_asset(
-            os.path.join(self.opts.basedir, 'deskshare/deskshare.webm'))
-        width, height = self._constrain(self._get_dimensions(asset),
-                                        (self.slides_width, self.opts.height))
-        duration = asset.props.duration
+        duration = self._get_duration(video)
+        tsoffset = self._opening_credits_length
+        cut_start, cut_end = self._cut
+        box = self.fit(video, fit, align)
+
         for event in events:
-            start = round(float(event.get('start_timestamp')) * Gst.SECOND)
-            end = round(float(event.get('stop_timestamp')) * Gst.SECOND)
-            # Trim event to duration of video
-            if start > duration: continue
-            end = min(end, duration)
+            share_start = to_ns(event.get('start_timestamp'))
+            share_end = to_ns(event.get('stop_timestamp'))
+            # These are useless? The actual video is bigger, and runtime size
+            #   changes are not reflected in the xml :/
+            # video_width = int(event.get('video_width'))
+            # video_height = int(event.get('video_height'))
+            if share_start >= share_end or share_end > duration:
+                continue # Bad data?
+            if share_end <= cut_start or share_start >= cut_end:
+                continue # Not within time frame
 
-            self._add_clip(layer, asset, start, start, end - start,
-                           0, 0, width, height)
+            ts = tsoffset + share_start - cut_start
+            skip = max(cut_start, share_start)
+            dt = min(cut_end, share_end) - skip
 
-    def add_backdrop(self):
-        if not self.opts.backdrop:
-            return
-        layer = self._add_layer('Backdrop')
-        asset = self._get_asset(self.opts.backdrop)
-        self._add_clip(layer, asset, 0, 0, self.end_time,
-                       0, 0, self.opts.width, self.opts.height)
+            self._add_clip('Deskshare', video,
+                ts=ts, skip=skip, dt=dt,
+                pos=box[:2], size=box[2:])
 
-    def add_credits(self):
-        if not (self.opts.opening_credits or self.opts.closing_credits):
-            return
+    def add_backdrop(self, image):
+        self._add_clip("Backdrop", image,
+            ts=0, dt=self._total_length,
+            pos=(0, 0), size=(self.width, self.height))
 
-        layer = self._add_layer('credits')
-        for fname in self.opts.opening_credits:
-            duration = None
-            if ':' in fname:
-                fname, duration = fname.rsplit(':', 1)
-                duration = round(float(duration) * Gst.SECOND)
+    def add_opening_credits(self, fname, skip=0, duration=0):
+        skip = to_ns(skip)
+        duration = to_ns(duration)
+        tsoffset = self._opening_credits_length
+        maxdt = self._get_duration(fname) - skip
+        duration = min(duration or maxdt, maxdt)
 
-            asset = self._get_asset(fname)
-            if duration is None:
-                if asset.is_image():
-                    duration = 3 * Gst.SECOND
-                else:
-                    duration = asset.props.duration
+        self._add_clip('Credits', fname,
+            ts=tsoffset, dt=duration,
+            pos=(0,0), size=(self.width, self.height))
 
-                    dims = self._get_dimensions(asset)
+        self._opening_credits.append((skip, duration, fname))
 
-            dims = self._get_dimensions(asset)
-            width, height = self._constrain(
-                dims, (self.opts.width, self.opts.height))
+    def add_closing_credits(self, fname, skip=0, duration=0):
+        skip = to_ns(skip)
+        duration = to_ns(duration)
+        tsoffset = self._total_length
+        maxdt = self._get_duration(fname) - skip
+        duration = min(duration or maxdt, maxdt)
 
-            self._add_clip(layer, asset, 0, 0, duration,
-                           0, 0, width, height, trim_end=False)
-            self.opening_length += duration
+        self._add_clip('Credits', fname,
+            ts=tsoffset, dt=duration,
+            pos=(0,0), size=(self.width, self.height))
 
-        closing_length = 0
-        for fname in self.opts.closing_credits:
-            duration = None
-            if ':' in fname:
-                fname, duration = fname.rsplit(':', 1)
-                duration = round(float(duration) * Gst.SECOND)
+        self._closing_credits.append((skip, duration, fname))
 
-            asset = self._get_asset(fname)
-            if duration is None:
-                if asset.is_image():
-                    duration = 3 * Gst.SECOND
-                else:
-                    duration = asset.props.duration
-
-                    dims = self._get_dimensions(asset)
-
-            dims = self._get_dimensions(asset)
-            width, height = self._constrain(
-                dims, (self.opts.width, self.opts.height))
-
-            self._add_clip(layer, asset, self.end_time + closing_length, 0,
-                           duration, 0, 0, width, height, trim_end=False)
-            closing_length += duration
-
-    def save(self):
+    def save(self, target):
         self.timeline.commit_sync()
-        self.timeline.save_to_uri(file_to_uri(self.opts.project), None, True)
+        self.timeline.save_to_uri(file_to_uri(target), None, True)
 
+
+parser = argparse.ArgumentParser(description='convert a BigBlueButton presentation into a GES project')
+parser.add_argument('--size', metavar='WIDTHxHEIGHT', type=str, default="1920x1080",
+                    help='Video width and height')
+parser.add_argument('--margin', metavar='WIDTH', type=int, default=10,
+                    help='Space between and around webcam and presentation areas.')
+
+parser.add_argument('--start', metavar='SECONDS', type=float, default=0,
+                    help='Seconds to skip from the start of the recording')
+parser.add_argument('--end', metavar='SECONDS', type=float, default=0,
+                    help='End point in the recording')
+parser.add_argument('--webcam-width', metavar='WIDTH', type=float, default=0.2,
+                    help='Width of the webcam area in pixel, or as a fraction.')
+
+parser.add_argument('--backdrop', metavar='FILE', type=str, default=None,
+                    help='Backdrop image for the project')
+
+parser.add_argument('--opening-credits', metavar='FILE',
+                    type=str, action='append', default=[],
+                    help='File to use as opening credits (may be repeated)')
+parser.add_argument('--closing-credits', metavar='FILE',
+                    type=str, action='append', default=[],
+                    help='File to use as closing credits (may be repeated)')
+
+parser.add_argument('basedir', metavar='PATH', type=str,
+                    help='Directory containing BBB presentation assets')
+parser.add_argument('target', metavar='FILE', type=str,
+                    help='Output filename for GES project')
 
 def main(argv):
-    parser = argparse.ArgumentParser(description='convert a BigBlueButton presentation into a GES project')
-    parser.add_argument('--start', metavar='SECONDS', type=float, default=0,
-                        help='Seconds to skip from the start of the recording')
-    parser.add_argument('--end', metavar='SECONDS', type=float, default=None,
-                        help='End point in the recording')
-    parser.add_argument('--width', metavar='WIDTH', type=int, default=1920,
-                        help='Video width')
-    parser.add_argument('--height', metavar='HEIGHT', type=int, default=1080,
-                        help='Video height')
-    parser.add_argument('--webcam-size', metavar='PERCENT', type=int,
-                        default=25, choices=range(100),
-                        help='Amount of screen to reserve for camera')
-    parser.add_argument('--stretch-webcam', action='store_true',
-                        help='Stretch webcam to 16:9 aspect ratio')
-    parser.add_argument('--backdrop', metavar='FILE', type=str, default=None,
-                        help='Backdrop image for the project')
-    parser.add_argument('--opening-credits', metavar='FILE[:DURATION]',
-                        type=str, action='append', default=[],
-                        help='File to use as opening credits (may be repeated)')
-    parser.add_argument('--closing-credits', metavar='FILE[:DURATION]',
-                        type=str, action='append', default=[],
-                        help='File to use as closing credits (may be repeated)')
-    parser.add_argument('--annotations', action='store_true', default=False,
-                        help='Add annotations to slides (requires inkscape)')
-    parser.add_argument('basedir', metavar='PRESENTATION-DIR', type=str,
-                        help='directory containing BBB presentation assets')
-    parser.add_argument('project', metavar='OUTPUT', type=str,
-                        help='output filename for GES project')
-    opts = parser.parse_args(argv[1:])
     Gst.init(None)
     GES.init()
-    p = Presentation(opts)
-    p.save()
 
+    opts = parser.parse_args(argv[1:])
+    source = opts.basedir
+    width, height = tuple(map(int, opts.size.split("x", 2)))
+
+    p = Presentation(source=source, size=(width, height))
+
+    if opts.start or opts.end:
+        p.cut(opts.start, opts.end)
+
+    for fname in opts.opening_credits or []:
+        p.add_opening_credits(fname)
+
+    if opts.backdrop:
+        p.add_backdrop(opts.backdrop)
+
+    for fname in opts.closing_credits or []:
+        p.add_closing_credits(fname)
+
+    margin = opts.margin
+    cam_width = opts.webcam_width
+    if 0 < cam_width < 1:
+        cam_width = int(cam_width * width)
+
+    max_height = int(height - 2 * margin)
+    slides_width = int(width - 2 * margin)
+
+    if cam_width > 0:
+        slides_width -= int(cam_width + margin)
+        p.add_webcams(fit=(slides_width + 2 * margin, margin, cam_width, max_height), align="lt")
+
+    p.add_slides(fit=(margin, margin, slides_width, max_height), align="ct")
+    p.add_deskshare(fit=(margin, margin, slides_width, max_height), align="ct")
+
+    p.save(opts.target)
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
