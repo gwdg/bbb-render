@@ -9,18 +9,25 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import shutil
 
-
 def fetch(url, target: Path):
+    if target.exists() and target.stat().st_size > 0:
+        print(f"Skipped: {url}")
+        return target
+
     try:
-        print(f"Downloading {url}")
+        print(f"Downloading: {url}")
         with urllib.request.urlopen(url) as rs:
             os.makedirs(target.parent, exist_ok=True)
             with open(target, 'wb') as fp:
                 shutil.copyfileobj(rs, fp)
         return target
     except urllib.error.HTTPError as e:
-        print(f"Download failed: {url} ({e})")
-        return False
+        print(f"Failed: {url} ({e})")
+        return
+    except KeyboardInterrupt:
+        if target.exists():
+            target.unlink()
+        raise
 
 def getMeetingId(url):
     for pattern in (
@@ -34,6 +41,7 @@ def getMeetingId(url):
 def download(url, outputPath: Path):
     meetingId = getMeetingId(url)
     base = urllib.parse.urljoin(url, f"/presentation/{meetingId}/")
+
     def sfetch(name):
         return fetch(urllib.parse.urljoin(base, name), outputPath / name)
 
