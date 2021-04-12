@@ -17,7 +17,7 @@ Services libraries.  On an Ubuntu 20.04 system, you will need to
 install at least the following:
 
 ```
-sudo apt install python3-gi gir1.2-ges-1.0 ges1.0-tools
+sudo apt install python3-gi gir1.2-ges-1.0 ges1.0-tools libgirepository1.0-dev
 ```
 
 You may also want to install the [Pitivi video
