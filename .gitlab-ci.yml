@@ -1,0 +1,19 @@
+stages:
+  - docker
+
+mkdocker:
+  stage: docker
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    KANIKO: /kaniko/executor --skip-unused-stages=true
+  script:
+    - $KANIKO --context . --dockerfile Dockerfile --destination $CI_REGISTRY_IMAGE:${CI_COMMIT_REF_NAME/master/latest}
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+  only:
+    refs:
+      - branches
+      - tags
