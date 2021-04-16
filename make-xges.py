@@ -315,7 +315,7 @@ class Presentation:
             img_start = max(img_start, start_ts)
             img_end = min(img_end, end_ts)
 
-            # Fix backgfound image path
+            # Fix backgound image path
             img.set("{http://www.w3.org/1999/xlink}href", self._asset_path(path))
 
             # Find an SVG group with shapes belonging to this slide.
@@ -343,12 +343,9 @@ class Presentation:
 
                 # Poll results are embedded as images. Make the href absolute.
                 for shape_img in shape.iterfind("./{http://www.w3.org/2000/svg}image"):
-                    shape_img.set(
-                        "{http://www.w3.org/1999/xlink}href",
-                        self._asset_path(
-                            shape_img.get("{http://www.w3.org/1999/xlink}href")
-                        ),
-                    )
+                    href = shape_img.get("{http://www.w3.org/1999/xlink}href")
+                    href = self._asset_path(href)
+                    shape_img.set("{http://www.w3.org/1999/xlink}href", href)
 
                 start = to_ns(shape.get("timestamp"))
                 undo = to_ns(shape.get("undo"))
@@ -406,9 +403,7 @@ class Presentation:
     def _render_slide(self, layers, size, name):
         path = self._asset_path(name)
         if not os.path.exists(path):
-            svg = ET.XML(
-                f'<svg version="1.1" xmlns="http://www.w3.org/2000/svg"></svg>'
-            )
+            svg = ET.XML('<svg version="1.1" xmlns="http://www.w3.org/2000/svg"></svg>')
 
             # Scale to desired size but keep coordinates
             bg = layers[0]  # Use first (bottom) layer as reference frame
